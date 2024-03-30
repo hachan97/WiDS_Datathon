@@ -1,0 +1,127 @@
+---
+title: "XGBoost"
+author: "Bryan Chan"
+format: html
+editor: visual
+---
+
+# Setup
+
+```{r Setup}
+# Codes to install the need packaged and it'll output the package(s) that may have failed to load
+knitr::opts_chunk$set(echo = TRUE)
+p_needed <-
+  c("tidyverse",
+    "tidymodels",     # a collection of packages for machine learning 
+    "ranger",         # for Unconditional Random Forest implementation
+    "vip",            # for plotting variable importance
+    "partykit",       # 
+    "haven"           #to open .dta datasets
+    )
+
+packages <- rownames(installed.packages())
+p_to_install <- p_needed[!(p_needed %in% packages)]
+
+if (length(p_to_install) > 0) {
+  install.packages(p_to_install)
+}
+sapply(p_needed, require, character.only = TRUE)
+```
+
+# Beach Volleyball Games
+
+to predict whether a beach volleyball team of two won their match based on game play stats like errors, blocks, attacks, etc from this week's #TidyTuesday dataset
+
+```{r}
+vb_matches <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-05-19/vb_matches.csv', guess_max = 76000)
+#saveRDS(vb_matches, file = "vb_matches.rds")
+
+vb_matches <- readRDS("vb_matches.rds")
+vb_matches
+```
+
+# Process Data
+
+This dataset has the match stats like serve errors, kills, and so forth divided out by the two players for each team, but we want those combined together because we are going to make a prediction per team (i.e. what makes a team more likely to win). Let's include predictors like gender, circuit, and year in our model along with the per-match statistics. Let's omit matches with NA values because we don't have all kinds of statistics measured for all matches.
+
+```{r}
+vb_parsed <- vb_matches %>%
+  transmute(
+    circuit,
+    gender,
+    year,
+    w_attacks = w_p1_tot_attacks + w_p2_tot_attacks,
+    w_kills = w_p1_tot_kills + w_p2_tot_kills,
+    w_errors = w_p1_tot_errors + w_p2_tot_errors,
+    w_aces = w_p1_tot_aces + w_p2_tot_aces,
+    w_serve_errors = w_p1_tot_serve_errors + w_p2_tot_serve_errors,
+    w_blocks = w_p1_tot_blocks + w_p2_tot_blocks,
+    w_digs = w_p1_tot_digs + w_p2_tot_digs,
+    l_attacks = l_p1_tot_attacks + l_p2_tot_attacks,
+    l_kills = l_p1_tot_kills + l_p2_tot_kills,
+    l_errors = l_p1_tot_errors + l_p2_tot_errors,
+    l_aces = l_p1_tot_aces + l_p2_tot_aces,
+    l_serve_errors = l_p1_tot_serve_errors + l_p2_tot_serve_errors,
+    l_blocks = l_p1_tot_blocks + l_p2_tot_blocks,
+    l_digs = l_p1_tot_digs + l_p2_tot_digs
+  ) %>%
+  na.omit()
+
+```
+
+```{r}
+winners <- vb_parsed %>%
+  select(circuit, gender, year,
+         w_attacks:w_digs) %>%
+  rename_with(~ str_remove_all(., "w_"), w_attacks:w_digs) %>%
+  mutate(win = "win")
+
+losers <- vb_parsed %>%
+  select(circuit, gender, year,
+         l_attacks:l_digs) %>%
+  rename_with(~ str_remove_all(., "l_"), l_attacks:l_digs) %>%
+  mutate(win = "lose")
+
+vb_df <- bind_rows(winners, losers) %>%
+  mutate_if(is.character, factor)
+
+```
+
+# EDA
+
+Exploratory Data Analysis
+
+```{r}
+vb_df %>%
+  pivot_longer(attacks:digs, names_to = "stat", values_to = "value") %>%
+  ggplot(aes(gender, value, fill = win, color = win)) +
+  geom_boxplot(alpha = 0.4) +
+  facet_wrap(~stat, scales = "free_y", nrow = 2) +
+  labs(y = NULL, color = NULL, fill = NULL)
+
+```
+
+# Split & Bootstrap
+
+```{r}
+set.seed(123)
+vb_split <- initial_split(vb_df, strata = win)
+vb_train <- training(vb_split)
+vb_test <- testing(vb_split)
+```
+
+# Build Model
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(),                     ## first three: model complexity
+  sample_size = tune(), mtry = tune(),         ## randomness
+  learn_rate = tune()                          ## step size
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_spec
+```

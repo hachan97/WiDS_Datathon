@@ -1,0 +1,395 @@
+---
+title: "XGBoost"
+author: "Bryan Chan"
+format: html
+editor: visual
+---
+
+# Setup
+
+```{r Setup}
+# Codes to install the need packaged and it'll output the package(s) that may have failed to load
+knitr::opts_chunk$set(echo = TRUE)
+p_needed <-
+  c("tidyverse",
+    "tidymodels",     # a collection of packages for machine learning 
+    "ranger",         # for Unconditional Random Forest implementation
+    "vip",            # for plotting variable importance
+    "xgboost",
+    "DALEX",
+    "DALEXtra",
+    "partykit",       # 
+    "here",
+    "haven"           #to open .dta datasets
+    )
+
+packages <- rownames(installed.packages())
+p_to_install <- p_needed[!(p_needed %in% packages)]
+
+if (length(p_to_install) > 0) {
+  install.packages(p_to_install)
+}
+sapply(p_needed, require, character.only = TRUE)
+```
+
+# Load & Process Data
+
+to predict whether a beach volleyball team of two won their match based on game play stats like errors, blocks, attacks, etc from this week's #TidyTuesday dataset
+
+```{r}
+# Training Data
+
+training_data <- readr::read_csv(here("data/training_clean.csv")) %>% 
+  mutate( DiagPeriodL90D = as.factor(DiagPeriodL90D))
+```
+
+```{r}
+# Testing Data
+test_data <- readr::read_csv(here("data/test.csv")) %>% 
+  mutate(Ozone = as.numeric(Ozone),
+         PM25 = as.numeric(PM25),
+         N02 = as.numeric(N02)
+         
+         )
+
+unique(test_data$N02)
+
+
+
+test_cleaned <- readr::read_csv(here("data/test_clean.csv"))
+test_encoded <- readr::read_csv(here("data/test_encoded.csv"))
+
+
+class(test_data$Ozone)
+
+class(training_data$Ozone)
+
+```
+
+
+# EDA
+
+Exploratory Data Analysis
+
+```{r}
+colnames(df_parsed)
+```
+
+# Split & Bootstrap
+
+```{r}
+set.seed(123)
+df_split <- initial_split(df_parsed, strata = DiagPeriodL90D)
+df_train <- training(df_split)
+df_test <- testing(df_split)
+
+df_boot <- bootstraps(df_train)
+
+```
+
+# Build: Random Forest
+
+## Model Specification
+
+```{r}
+rf_specification <- rand_forest() %>%
+  set_mode("classification") %>%
+  set_engine("ranger", 
+             importance = "permutation") 
+```
+
+## Workflow definition
+
+```{r}
+rf_workflow <- workflow() %>%
+  add_model(rf_specification) %>% 
+  add_variables(outcome = DiagPeriodL90D,
+                predictors = c(patient_age, patient_gender, bmi,
+                               Region, Division,
+                               population, density, age_median,
+                               family_size, income_household_median, education_bachelors,
+                               education_graduate, education_college_or_above,
+                               labor_force_participation, unemployment_rate,
+                               race_white, race_black, race_asian, race_native,
+                               race_pacific, race_other, race_multiple,
+                               hispanic, disabled, poverty, limited_english,
+                               commute_time, health_uninsured, veteran,
+                               Ozone, PM25, N02) )
+```
+
+-   raus: east (besser via region), migback (besser via ethni), deadchild (zu wenig fälle), health (weil bad health sowohl die wahrsch erhöhen als auch verringern kann, je nach health issue)
+
+## RUN Training Model
+
+```{r}
+rf_result <- rf_workflow %>% 
+  fit_resamples(
+    resamples = df_boot,
+    control = control_resamples(save_pred = TRUE) )
+
+saveRDS(rf_result, file = "rf_result")
+#crf_result <- readRDS("crf_result1")
+
+## Evaluate the model
+rf_result %>% 
+  collect_metrics()
+
+rf_result %>% 
+  conf_mat_resampled()
+```
+
+## RUN Test Model
+
+```{r}
+rf_final <- rf_workflow %>% 
+  last_fit(df_split)
+
+saveRDS(rf_final, file = "rf_final")
+#rf_final <- readRDS("rf_final")
+
+## Evaluate the model
+rf_final %>% 
+  collect_metrics()
+
+rf_final %>%
+  collect_predictions() %>%  
+  conf_mat(DiagPeriodL90D, .pred_class)
+```
+
+## Plot
+
+### Explainer
+
+```{r}
+
+final_fitted <- rf_final$.workflow[[1]]
+
+rf_explain <- explain_tidymodels(
+  final_fitted,
+  data = dplyr::select(df_train, -DiagPeriodL90D),
+  y = as.integer(df_train$DiagPeriodL90D),
+  verbose = FALSE)
+```
+
+### Variable Importance Plot
+
+Look at which variables are most important for making correct classifications
+
+```{r}
+set.seed(10) #since we are sampling & permuting, we set a seed so we can replicate the results
+rf_var_imp <- 
+  model_parts(
+    rf_explain
+    )
+
+vip_plot1 <- plot(rf_var_imp, show_boxplots = TRUE)
+ggsave("VIMP_plot1.jpg", vip_plot1, width = 7, height = 10)
+```
+
+```{r}
+rf_extracts <- extract_fit_parsnip(rf_final)
+vip_plot <- vip(rf_extracts,
+                num_features = 80L)
+vip_plot
+
+ggsave("VIMP_plot2.jpg", vip_plot, width = 7, height = 10)
+
+?vip()
+```
+
+# Build: XGboost
+
+## Model Specification
+```{r}
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(),                     ## first three: model complexity
+  sample_size = tune(), mtry = tune(),         ## randomness
+  learn_rate = tune()                          ## step size
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_spec
+```
+
+## Hyperparameter 
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), training_data),
+  learn_rate(),
+  size = 30
+)
+
+xgb_grid
+
+```
+## Workflow definition
+```{r}
+xgb_wf <- workflow() %>%
+  add_formula(DiagPeriodL90D ~ .) %>%
+  add_model(xgb_spec)
+
+xgb_wf
+
+
+```
+## Tunning : Cross-Validation
+```{r}
+set.seed(123)
+df_folds <- vfold_cv(training_data, strata = DiagPeriodL90D)
+
+df_folds
+
+```
+## RUN Training Model
+
+IT’S TIME TO TUNE. We use tune_grid() with our tuneable workflow, our resamples, and our grid of parameters to try. Let’s use control_grid(save_pred = TRUE) so we can explore the predictions afterwards.
+
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(234)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = df_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+saveRDS(xgb_res, file = "xgb_res")
+```
+Review issues with some computations:
+
+```{r}
+show_notes(.Last.tune.result)
+```
+
+
+## Results
+```{r}
+collect_metrics(xgb_res)
+```
+Plots
+```{r}
+# Plots
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+## Metrics Selection
+
+What are the best performing sets of parameters?
+```{r}
+show_best(xgb_res, "roc_auc")
+
+# Let’s choose the best one.
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+```
+## Finalize Parameters
+```{r}
+final_xgb <- finalize_workflow(
+  xgb_wf,
+  best_auc
+)
+
+ 
+saveRDS(final_xgb, file = "final_xgb")
+
+final_xgb <- readRDS("final_xgb")
+```
+
+## VIP
+```{r}
+final_xgb %>%
+  fit(data = training_data) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+```
+# Final Test Model
+```{r}
+# Fit the model on the entire training data
+final_fit <- fit(final_xgb, data = training_data)
+
+# Make predictions on the test data
+predictions <- predict(final_fit, new_data = test_data)
+probabilities <- predict(final_fit, new_data = test_data, type = "prob") %>% #probabilities
+  rename(column1 = ".pred_0", column2 = ".pred_1" )
+
+
+# Write the DataFrame to a CSV file
+output <- data.frame(patient_id = test_data$patient_id, DiagPeriodL90D = probabilities$column2)
+
+
+# Write to a CSV file
+write.csv(output, file = "submission.csv", row.names = FALSE)
+
+```
+
+```{r}
+# Extract the workflow from the last_fit object
+final_wf <- final_res %>% 
+  pull(.workflow[[1]])
+
+# Make predictions on the test set
+predictions <- predict(final_wf, new_data = test_data)
+
+# Extract the probabilities
+probabilities <- predictions$.pred_class1
+
+# Write the probabilities to a CSV file
+write.csv(probabilities, file = "solution.csv")
+
+```
+
+
+
+## Plot ROC
+```{r}
+final_res %>%
+  collect_predictions() %>%
+  roc_curve(DiagPeriodL90D, .pred_0) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(size = 1.5, color = "midnightblue") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  )
+
+
+final_res %>%
+  collect_predictions() %>%
+  roc_curve(DiagPeriodL90D, .pred_1) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(size = 1.5, color = "midnightblue") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  )
+```
+
+The ROC curve with .pred_0 as the prediction probability: This curve is closer to the top of the graph, which suggests that the model is performing well in predicting the 1 class. The area under this ROC curve would be greater than 0.5, indicating a good model.
+
+The ROC curve with .pred_1 as the prediction probability: This curve is closer to the bottom of the graph, which suggests that the model is not performing well in predicting the 0 class. The area under this ROC curve would be less than 0.5, indicating a poor model.
+
+
+
+
